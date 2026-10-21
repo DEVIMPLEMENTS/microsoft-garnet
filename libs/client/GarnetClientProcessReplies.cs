@@ -205,6 +205,10 @@ namespace Garnet.client
                         return false;
                     result = resultArray;
                     break;
+                case (byte)'-':
+                    if (!RespReadResponseUtils.TryReadErrorAsString(out error, ref ptr, end))
+                        return false;
+                    break;
                 default:
                     ThrowException(new Exception("Unexpected response: " + Encoding.UTF8.GetString(new Span<byte>(ptr, (int)(end - ptr))).Replace("\n", "|").Replace("\r", "") + "]"));
                     break;

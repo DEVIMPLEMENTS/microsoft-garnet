@@ -371,6 +371,62 @@ namespace Garnet.test
             });
         }
 
+        [TestCase("string")]
+        [TestCase("binary")]
+        [TestCase("cancellation")]
+        [TestCase("callback")]
+        public async Task MemoryResultArrayErrorsPreservePendingReplies(string api)
+        {
+            using var server = TestUtils.CreateGarnetServer(TestUtils.MethodTestDir);
+            server.Start();
+            using var db = TestUtils.GetGarnetClient();
+            await db.ConnectAsync().ConfigureAwait(false);
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            await db.ExecuteForStringResultAsync("SET", ["key", "value"]).WaitAsync(timeout.Token).ConfigureAwait(false);
+
+            Memory<byte> operation = "$6\r\nLRANGE\r\n"u8.ToArray();
+            Memory<byte>[] arguments = ["key"u8.ToArray(), "0"u8.ToArray(), "-1"u8.ToArray()];
+            var rejected = api switch
+            {
+                "callback" => ExecuteCallback(),
+                "binary" => db.ExecuteForMemoryResultArrayAsync(operation, arguments),
+                "cancellation" => db.ExecuteForMemoryResultArrayWithCancellationAsync("LRANGE", ["key", "0", "-1"], timeout.Token),
+                _ => db.ExecuteForMemoryResultArrayAsync("LRANGE", ["key", "0", "-1"])
+            };
+            var following = db.ExecuteForMemoryResultArrayAsync("MGET", ["key"]);
+
+            var error = Assert.ThrowsAsync<Exception>(async () => await rejected.WaitAsync(timeout.Token).ConfigureAwait(false));
+            ClassicAssert.AreEqual("WRONGTYPE Operation against a key holding the wrong kind of value.", error.Message);
+            var values = await following.WaitAsync(timeout.Token).ConfigureAwait(false);
+            try
+            {
+                ClassicAssert.AreEqual(1, values.Length);
+                ClassicAssert.IsTrue(values[0].Span.SequenceEqual("value"u8));
+            }
+            finally
+            {
+                foreach (var value in values)
+                    value.Dispose();
+            }
+
+            Task<MemoryResult<byte>[]> ExecuteCallback()
+            {
+                var completion = new TaskCompletionSource<MemoryResult<byte>[]>(TaskCreationOptions.RunContinuationsAsynchronously);
+                db.ExecuteForMemoryResultArray((_, result, error) =>
+                {
+                    if (error.MemoryOwner == null)
+                    {
+                        completion.TrySetResult(result);
+                        return;
+                    }
+
+                    using (error)
+                        completion.TrySetException(new Exception(Encoding.UTF8.GetString(error.Span)));
+                }, 0, "LRANGE", ["key", "0", "-1"]);
+                return completion.Task;
+            }
+        }
+
         [Test]
         public async Task CanUseMGetTests([Values] bool disableObjectStore)
         {
