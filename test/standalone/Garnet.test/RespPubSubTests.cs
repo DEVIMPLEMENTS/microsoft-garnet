@@ -7,6 +7,7 @@ using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using Garnet.common;
 using NUnit.Framework;
 using NUnit.Framework.Legacy;
@@ -550,6 +551,67 @@ namespace Garnet.test
             // The connection must still be alive and usable afterwards.
             SendCommand(socket, "PING");
             StringAssert.Contains("+PONG", ReadAvailable(socket));
+        }
+
+        /// <summary>Reproduces a missed message when a normal client unsubscribes after receiving it.</summary>
+        [TestCase(false)]
+        [TestCase(true)]
+        [Explicit("Bounded cache correctness reproduction; no observed miss is inconclusive.")]
+        public async Task ClientUnsubscribeCanSkipAnotherSubscriber(bool pattern)
+        {
+            using var publisher = TestUtils.GetGarnetClient();
+            await publisher.ConnectAsync();
+            using var first = await ConnectionMultiplexer.ConnectAsync(TestUtils.GetConfig());
+            var listeners = await Task.WhenAll(Enumerable.Range(0, 8).Select(_ => ConnectionMultiplexer.ConnectAsync(TestUtils.GetConfig())));
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            const string channel = "delivery-check";
+            var subscription = pattern ? RedisChannel.Pattern("delivery-*") : RedisChannel.Literal(channel);
+            var payload = new string('x', 64 * 1024);
+            const string marker = "end-of-delivery";
+
+            try
+            {
+                for (var attempt = 1; attempt <= 1_000; attempt++)
+                {
+                    var firstMessages = await first.GetSubscriber().SubscribeAsync(subscription);
+                    var messages = await Task.WhenAll(listeners.Select(client => client.GetSubscriber().SubscribeAsync(subscription)));
+                    var receiving = messages.Select(queue => ReceivedBeforeMarker(queue, payload, marker, timeout.Token)).ToArray();
+
+                    var publishing = publisher.ExecuteForLongResultAsync("PUBLISH", [channel, payload]);
+                    Assert.That((await firstMessages.ReadAsync(timeout.Token)).Message.ToString(), Is.EqualTo(payload));
+                    await firstMessages.UnsubscribeAsync();
+                    var delivered = await publishing.WaitAsync(timeout.Token);
+                    Assert.That(await publisher.ExecuteForLongResultAsync("PUBLISH", [channel, marker]), Is.EqualTo(listeners.Length));
+                    var received = await Task.WhenAll(receiving);
+                    await Task.WhenAll(messages.Select(queue => queue.UnsubscribeAsync()));
+
+                    if (received.Any(value => !value))
+                    {
+                        TestContext.WriteLine($"REPRODUCED on attempt {attempt}: pattern={pattern}, PUBLISH returned {delivered}; {received.Count(value => !value)} of {listeners.Length} listeners missed the payload but received the marker.");
+                        return;
+                    }
+                }
+
+                Assert.Inconclusive("No missed delivery observed in 1,000 attempts.");
+            }
+            finally
+            {
+                foreach (var listener in listeners)
+                    listener.Dispose();
+            }
+        }
+
+        private static async Task<bool> ReceivedBeforeMarker(ChannelMessageQueue messages, string payload, string marker, CancellationToken token)
+        {
+            var received = false;
+            while (true)
+            {
+                var message = (await messages.ReadAsync(token)).Message.ToString();
+                if (message == marker)
+                    return received;
+                if (message == payload)
+                    received = true;
+            }
         }
 
         private static void SendCommand(Socket socket, params string[] args)
