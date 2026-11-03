@@ -2,8 +2,6 @@
 // Licensed under the MIT license.
 
 using System;
-using System.Globalization;
-using System.IO;
 using System.Linq;
 using System.Net.Sockets;
 using System.Security.Cryptography;
@@ -555,141 +553,64 @@ namespace Garnet.test
             StringAssert.Contains("+PONG", ReadAvailable(socket));
         }
 
-        /// <summary>
-        /// Attempts to reproduce a missed delivery using only RESP commands on four TCP connections.
-        /// All three subscriptions are acknowledged before each publication. The first client
-        /// unsubscribes after receiving the complete message; the other two stay subscribed until
-        /// a later marker arrives on each connection. The markers distinguish missing messages
-        /// from slow ones without relying on a delivery timeout.
-        /// </summary>
+        /// <summary>Reproduces a missed message when a normal client unsubscribes after receiving it.</summary>
         [TestCase(false)]
         [TestCase(true)]
-        [Explicit("Bounded race reproduction; a run without a missed message is inconclusive.")]
-        public async Task RespUnsubscribeDuringPublishCanSkipAnotherSubscriber(bool pattern)
+        [Explicit("Bounded cache correctness reproduction; no observed miss is inconclusive.")]
+        public async Task ClientUnsubscribeCanSkipAnotherSubscriber(bool pattern)
         {
-            using var first = OpenPubSubReproSocket();
-            using var middle = OpenPubSubReproSocket();
-            using var second = OpenPubSubReproSocket();
-            using var publisher = OpenPubSubReproSocket();
-            using var firstReader = new BufferedStream(new NetworkStream(first, ownsSocket: false));
-            using var middleReader = new BufferedStream(new NetworkStream(middle, ownsSocket: false));
-            using var secondReader = new BufferedStream(new NetworkStream(second, ownsSocket: false));
-            using var publisherReader = new BufferedStream(new NetworkStream(publisher, ownsSocket: false));
-            const string channel = "unsubscribe-race";
-            var subscription = pattern ? "unsubscribe-*" : channel;
-            var subscribe = pattern ? "PSUBSCRIBE" : "SUBSCRIBE";
-            var unsubscribe = pattern ? "PUNSUBSCRIBE" : "UNSUBSCRIBE";
-            var padding = new string('x', 64 * 1024);
+            using var publisher = TestUtils.GetGarnetClient();
+            await publisher.ConnectAsync();
+            using var first = await ConnectionMultiplexer.ConnectAsync(TestUtils.GetConfig());
+            var listeners = await Task.WhenAll(Enumerable.Range(0, 8).Select(_ => ConnectionMultiplexer.ConnectAsync(TestUtils.GetConfig())));
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            const string channel = "delivery-check";
+            var subscription = pattern ? RedisChannel.Pattern("delivery-*") : RedisChannel.Literal(channel);
+            var payload = new string('x', 64 * 1024);
+            const string marker = "end-of-delivery";
 
-            for (var attempt = 0; attempt < 1_000; attempt++)
+            try
             {
-                SendCommand(first, subscribe, subscription);
-                Assert.That(ReadPubSubReproFrame(firstReader)[0], Is.EqualTo(subscribe.ToLowerInvariant()));
-                SendCommand(middle, subscribe, subscription);
-                Assert.That(ReadPubSubReproFrame(middleReader)[0], Is.EqualTo(subscribe.ToLowerInvariant()));
-                SendCommand(second, subscribe, subscription);
-                Assert.That(ReadPubSubReproFrame(secondReader)[0], Is.EqualTo(subscribe.ToLowerInvariant()));
-
-                var payload = attempt.ToString(CultureInfo.InvariantCulture) + ":" + padding;
-                var marker = "marker:" + attempt.ToString(CultureInfo.InvariantCulture);
-                var middleReceiving = Task.Run(() => ReceivePubSubReproUntilMarker(middleReader, payload, marker));
-                var receiving = Task.Run(() => ReceivePubSubReproUntilMarker(secondReader, payload, marker));
-                var publishing = Task.Run(() =>
+                for (var attempt = 1; attempt <= 1_000; attempt++)
                 {
-                    SendCommand(publisher, "PUBLISH", channel, payload);
-                    return ReadPubSubReproLine(publisherReader);
-                });
+                    var firstMessages = await first.GetSubscriber().SubscribeAsync(subscription);
+                    var messages = await Task.WhenAll(listeners.Select(client => client.GetSubscriber().SubscribeAsync(subscription)));
+                    var receiving = messages.Select(queue => ReceivedBeforeMarker(queue, payload, marker, timeout.Token)).ToArray();
 
-                var firstMessage = ReadPubSubReproFrame(firstReader);
-                Assert.That(firstMessage[^1], Is.EqualTo(payload));
-                SendCommand(first, unsubscribe, subscription);
-                Assert.That(ReadPubSubReproFrame(firstReader)[0], Is.EqualTo(unsubscribe.ToLowerInvariant()));
-                var publishReply = await publishing.WaitAsync(TimeSpan.FromSeconds(10));
+                    var publishing = publisher.ExecuteForLongResultAsync("PUBLISH", [channel, payload]);
+                    Assert.That((await firstMessages.ReadAsync(timeout.Token)).Message.ToString(), Is.EqualTo(payload));
+                    await firstMessages.UnsubscribeAsync();
+                    var delivered = await publishing.WaitAsync(timeout.Token);
+                    Assert.That(await publisher.ExecuteForLongResultAsync("PUBLISH", [channel, marker]), Is.EqualTo(listeners.Length));
+                    var received = await Task.WhenAll(receiving);
+                    await Task.WhenAll(messages.Select(queue => queue.UnsubscribeAsync()));
 
-                SendCommand(publisher, "PUBLISH", channel, marker);
-                Assert.That(ReadPubSubReproLine(publisherReader), Is.EqualTo(":2"));
-                var middleReceivedPayload = await middleReceiving.WaitAsync(TimeSpan.FromSeconds(10));
-                var secondReceivedPayload = await receiving.WaitAsync(TimeSpan.FromSeconds(10));
-                SendCommand(middle, unsubscribe, subscription);
-                Assert.That(ReadPubSubReproFrame(middleReader)[0], Is.EqualTo(unsubscribe.ToLowerInvariant()));
-                SendCommand(second, unsubscribe, subscription);
-                Assert.That(ReadPubSubReproFrame(secondReader)[0], Is.EqualTo(unsubscribe.ToLowerInvariant()));
-
-                if (!middleReceivedPayload || !secondReceivedPayload)
-                {
-                    TestContext.WriteLine($"REPRODUCED via RESP on attempt {attempt + 1}: pattern={pattern}, first received payload, PUBLISH returned {publishReply}; middle received payload={middleReceivedPayload}, last received payload={secondReceivedPayload}; both stable subscribers received the later marker.");
-                    return;
+                    if (received.Any(value => !value))
+                    {
+                        TestContext.WriteLine($"REPRODUCED on attempt {attempt}: pattern={pattern}, PUBLISH returned {delivered}; {received.Count(value => !value)} of {listeners.Length} listeners missed the payload but received the marker.");
+                        return;
+                    }
                 }
-            }
 
-            Assert.Inconclusive("No missed delivery observed in 1,000 attempts; this does not establish that RESP synchronization prevents the race.");
+                Assert.Inconclusive("No missed delivery observed in 1,000 attempts.");
+            }
+            finally
+            {
+                foreach (var listener in listeners)
+                    listener.Dispose();
+            }
         }
 
-        private static bool ReceivePubSubReproUntilMarker(Stream reader, string payload, string marker)
+        private static async Task<bool> ReceivedBeforeMarker(ChannelMessageQueue messages, string payload, string marker, CancellationToken token)
         {
-            var receivedPayload = false;
+            var received = false;
             while (true)
             {
-                var message = ReadPubSubReproFrame(reader)[^1];
+                var message = (await messages.ReadAsync(token)).Message.ToString();
                 if (message == marker)
-                    return receivedPayload;
+                    return received;
                 if (message == payload)
-                    receivedPayload = true;
-            }
-        }
-
-        private static Socket OpenPubSubReproSocket()
-        {
-            var socket = new Socket(SocketType.Stream, ProtocolType.Tcp)
-            {
-                NoDelay = true,
-                ReceiveTimeout = 10_000,
-                SendTimeout = 10_000,
-                ReceiveBufferSize = 1 << 20
-            };
-            socket.Connect(TestUtils.EndPoint);
-            return socket;
-        }
-
-        private static string[] ReadPubSubReproFrame(Stream reader)
-        {
-            var header = ReadPubSubReproLine(reader);
-            Assert.That(header[0], Is.EqualTo('*'));
-            var values = new string[int.Parse(header.AsSpan(1), CultureInfo.InvariantCulture)];
-            for (var i = 0; i < values.Length; i++)
-            {
-                var valueHeader = ReadPubSubReproLine(reader);
-                if (valueHeader[0] == '$')
-                {
-                    var bytes = new byte[int.Parse(valueHeader.AsSpan(1), CultureInfo.InvariantCulture)];
-                    reader.ReadExactly(bytes);
-                    Assert.That(ReadPubSubReproLine(reader), Is.Empty);
-                    values[i] = Encoding.UTF8.GetString(bytes);
-                }
-                else
-                {
-                    Assert.That(valueHeader[0], Is.EqualTo(':'));
-                    values[i] = valueHeader[1..];
-                }
-
-            }
-            return values;
-        }
-
-        private static string ReadPubSubReproLine(Stream reader)
-        {
-            var text = new StringBuilder();
-            while (true)
-            {
-                var value = reader.ReadByte();
-                if (value < 0)
-                    throw new EndOfStreamException("RESP connection closed before a complete reply.");
-                if (value == '\r')
-                {
-                    Assert.That(reader.ReadByte(), Is.EqualTo((int)'\n'));
-                    return text.ToString();
-                }
-                text.Append((char)value);
+                    received = true;
             }
         }
 
@@ -702,15 +623,7 @@ namespace Garnet.test
                 var argBytes = Encoding.UTF8.GetByteCount(arg);
                 sb.Append('$').Append(argBytes).Append("\r\n").Append(arg).Append("\r\n");
             }
-            var bytes = Encoding.UTF8.GetBytes(sb.ToString());
-            var sent = 0;
-            while (sent < bytes.Length)
-            {
-                var written = socket.Send(bytes.AsSpan(sent), SocketFlags.None);
-                if (written == 0)
-                    throw new EndOfStreamException("RESP connection closed while sending a command.");
-                sent += written;
-            }
+            socket.Send(Encoding.UTF8.GetBytes(sb.ToString()));
         }
 
         /// <summary>
