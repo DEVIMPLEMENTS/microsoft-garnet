@@ -1,6 +1,7 @@
 ﻿// Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+using System;
 using System.Collections.Generic;
 
 namespace Garnet.common
@@ -13,6 +14,7 @@ namespace Garnet.common
     {
         SingleWriterMultiReaderLock rwLock;
         readonly List<T> list;
+        T[] snapshot;
 
         /// <summary>
         /// Constructor
@@ -49,6 +51,7 @@ namespace Garnet.common
             if (!list.Contains(item))
             {
                 list.Add(item);
+                snapshot = null;
                 ret = true;
             }
             rwLock.WriteUnlock();
@@ -68,6 +71,7 @@ namespace Garnet.common
             if (!list.Contains(item))
             {
                 list.Add(item);
+                snapshot = null;
                 ret = true;
             }
             count = list.Count;
@@ -89,6 +93,7 @@ namespace Garnet.common
             if (i == -1)
             {
                 list.Add(item);
+                snapshot = null;
                 addedItem = item;
                 ret = true;
             }
@@ -109,8 +114,35 @@ namespace Garnet.common
         {
             rwLock.WriteLock();
             var ret = list.Remove(item);
+            if (ret)
+                snapshot = null;
             rwLock.WriteUnlock();
             return ret;
+        }
+
+        /// <summary>
+        /// Returns a stable, read-only snapshot. No collection lock is held while the caller
+        /// uses it, so callbacks may safely add or remove items. The snapshot is cached until
+        /// the set changes, avoiding an allocation for each read.
+        /// </summary>
+        /// <returns>The items captured before this method returns.</returns>
+        public ReadOnlySpan<T> GetSnapshot()
+        {
+            rwLock.ReadLock();
+            var items = snapshot;
+            rwLock.ReadUnlock();
+            if (items != null)
+                return items;
+
+            rwLock.WriteLock();
+            try
+            {
+                return snapshot ??= [.. list];
+            }
+            finally
+            {
+                rwLock.WriteUnlock();
+            }
         }
 
         /// <summary>
@@ -141,6 +173,7 @@ namespace Garnet.common
         {
             rwLock.WriteLock();
             list.Clear();
+            snapshot = [];
             rwLock.WriteUnlock();
         }
     }

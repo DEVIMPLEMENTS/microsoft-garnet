@@ -82,8 +82,7 @@ namespace Garnet.server
             {
                 if (subscriptions.TryGetValue(new ByteArrayWrapper(key), out var sessions))
                 {
-                    var index = 0;
-                    while (sessions.Iterate(ref index, out var session))
+                    foreach (var session in sessions.GetSnapshot())
                     {
                         session.Publish(key, value);
                         numSubscribers++;
@@ -93,8 +92,7 @@ namespace Garnet.server
 
             if (patternSubscriptions != null)
             {
-                var index1 = 0;
-                while (patternSubscriptions.Iterate(ref index1, out var entry))
+                foreach (var entry in patternSubscriptions.GetSnapshot())
                 {
                     var pattern = entry.pattern;
                     fixed (byte* patternPtr = pattern.ReadOnlySpan)
@@ -103,8 +101,7 @@ namespace Garnet.server
                         if (Match(key, patternSlice))
                         {
                             var sessions = entry.subscriptions;
-                            var index2 = 0;
-                            while (sessions.Iterate(ref index2, out var session))
+                            foreach (var session in sessions.GetSnapshot())
                             {
                                 session.PatternPublish(patternSlice, key, value);
                                 numSubscribers++;
