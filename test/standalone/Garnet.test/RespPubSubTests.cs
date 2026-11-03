@@ -558,7 +558,7 @@ namespace Garnet.test
         /// <summary>
         /// Attempts to reproduce a missed delivery using only RESP commands on four TCP connections.
         /// All three subscriptions are acknowledged before each publication. The first client
-        /// unsubscribes as soon as it reads the message header; the other two stay subscribed until
+        /// unsubscribes after receiving the complete message; the other two stay subscribed until
         /// a later marker arrives on each connection. The markers distinguish missing messages
         /// from slow ones without relying on a delivery timeout.
         /// </summary>
@@ -600,8 +600,9 @@ namespace Garnet.test
                     return ReadPubSubReproLine(publisherReader);
                 });
 
-                var firstMessage = ReadPubSubReproFrame(firstReader, () => SendCommand(first, unsubscribe, subscription));
+                var firstMessage = ReadPubSubReproFrame(firstReader);
                 Assert.That(firstMessage[^1], Is.EqualTo(payload));
+                SendCommand(first, unsubscribe, subscription);
                 Assert.That(ReadPubSubReproFrame(firstReader)[0], Is.EqualTo(unsubscribe.ToLowerInvariant()));
                 var publishReply = await publishing.WaitAsync(TimeSpan.FromSeconds(10));
 
@@ -650,7 +651,7 @@ namespace Garnet.test
             return socket;
         }
 
-        private static string[] ReadPubSubReproFrame(Stream reader, Action onMessageHeader = null)
+        private static string[] ReadPubSubReproFrame(Stream reader)
         {
             var header = ReadPubSubReproLine(reader);
             Assert.That(header[0], Is.EqualTo('*'));
@@ -671,8 +672,6 @@ namespace Garnet.test
                     values[i] = valueHeader[1..];
                 }
 
-                if (i == 0 && values[i] is "message" or "pmessage")
-                    onMessageHeader?.Invoke();
             }
             return values;
         }
